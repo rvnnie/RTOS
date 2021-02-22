@@ -1,0 +1,523 @@
+/* Ronald Keating
+ * CS452
+ * Assignment 8
+ * Stepper Motor
+*/
+
+#include <Arduino_FreeRTOS.h>
+#include <Arduino.h>
+#include <queue.h>
+#include <semphr.h>
+#include "ClosedCube_HDC1080.h"
+#include "Stepper.h"
+
+#define LED_BUILTIN 13
+
+// segment sides pins
+#define SevenSegCC1 44 // right
+#define SevenSegCC2 46 // left
+
+// segment sections pins                  
+#define SevenSegA 4 // top                 A
+#define SevenSegB 5 // top right         F   B
+#define SevenSegC 6 // bottom right        G
+#define SevenSegD 7 // bottom            E   C
+#define SevenSegE 8 // bottom left         D   DP
+#define SevenSegF 9 // top left
+#define SevenSegG 10 // middle
+#define SevenSegDP 11 // decimal
+
+// dip switches
+#define DIP0 53
+#define DIP1 51
+#define DIP2 49
+#define DIP3 47
+#define DIP4 45
+#define DIP5 43
+#define DIP6 41
+#define DIP7 39
+
+// just some extra definitions I included
+#define FRAME_RATE 2/3
+#define ONE_SEC 1000 / portTICK_PERIOD_MS
+#define HALF_SEC 1000 / portTICK_PERIOD_MS / 2
+#define ONE_TICK 1
+#define ON 1
+#define OFF 0
+
+// class to use the temp and humidity sensor
+ClosedCube_HDC1080 temp_hum_sensor;
+
+// number of steps per revolution
+#define NUM_STEPS_PER_REV 2048
+
+// stepper motor
+Stepper step_motor(NUM_STEPS_PER_REV, 22, 26, 24, 28);
+
+// define two tasks for Blink & AnalogRead
+void TaskSevenSeg(void *pvParamters);
+void TaskMain(void *pvParameters);
+void TaskBlink(void *pvParameters);
+void TaskStepperMotor(void *pvParameters);
+
+// three seperate queues, for each side of the seven seg and the blink task
+QueueHandle_t LeftQueue;
+QueueHandle_t RightQueue;
+QueueHandle_t BlinkQueue;
+QueueHandle_t StepperQueue;
+
+SemaphoreHandle_t DisplaySemaphore;
+
+TaskHandle_t LeftTask_Handle;
+TaskHandle_t RightTask_Handle;
+
+// the setup function runs once when you press reset or power the board
+void setup()
+{
+  // begin serial monitor
+  Serial.begin(115200);
+  // start reading from Temperature/Humidity ensor
+  temp_hum_sensor.begin(0x40);
+  // initialize pin mode
+  pinMode(SevenSegA, OUTPUT);
+  pinMode(SevenSegB, OUTPUT);
+  pinMode(SevenSegC, OUTPUT);
+  pinMode(SevenSegD, OUTPUT);
+  pinMode(SevenSegE, OUTPUT);
+  pinMode(SevenSegF, OUTPUT);
+  pinMode(SevenSegG, OUTPUT);
+  pinMode(SevenSegDP, OUTPUT);
+
+  // almost forgot to turn on pin 13 led
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  // seven seg init
+  pinMode(SevenSegCC1, OUTPUT);
+  pinMode(SevenSegCC2, OUTPUT);
+
+  // dip switches
+  pinMode(DIP0, INPUT);
+  pinMode(DIP1, INPUT);
+  pinMode(DIP2, INPUT);
+  pinMode(DIP3, INPUT);
+  // only need to read from first 4
+  pinMode(DIP4, INPUT);
+  pinMode(DIP5, INPUT);
+  pinMode(DIP6, INPUT);
+  pinMode(DIP7, INPUT);
+
+  step_motor.setSpeed(6);
+  // 4 for each rotation being 15 seconds
+
+  // three queues: left and right seven seg and blink queue
+  LeftQueue = xQueueCreate(5, sizeof(int));
+  RightQueue = xQueueCreate(5, sizeof(int));
+  StepperQueue = xQueueCreate(2, sizeof(int));
+  BlinkQueue = xQueueCreate(1, sizeof(int));
+
+  DisplaySemaphore = xSemaphoreCreateBinary();
+  xSemaphoreGive(DisplaySemaphore);
+
+  // 
+  if(BlinkQueue != NULL && LeftQueue != NULL && RightQueue != NULL)
+  { 
+    xTaskCreate(TaskMain, "Highest priority task, main", 128, NULL, 4, NULL);
+    xTaskCreate(TaskBlink, "Blink D13", 128, NULL, 0, NULL);
+    xTaskCreate(TaskSevenSeg, "Left 7 Seg Display", 128, NULL, 1, &LeftTask_Handle);
+    xTaskCreate(TaskStepperMotor, "Stepper motor task", 256, NULL, 3, NULL);
+  }
+  vTaskStartScheduler();
+}
+
+// everything is done in tasks
+void loop()
+{
+  // i guess you do need this
+}
+
+// prints the numbers, will add hex in the future
+void numbers(int num, int ON_OFF)
+{
+  // hopefully this makes sense to anyone
+  switch (num)
+  {
+  case 0:
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    break;
+  case 1:
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    break;
+  case 2:
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    break;
+  case 3:
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    break;
+  case 4:
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    break;
+  case 5:
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    break;
+  case 6:
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    break;
+  case 7:
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    break;
+  case 8:
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    break;
+  case 9:
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    break;
+  case 10: // A
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    break;
+  case 11: // b (lowercase cuz 8)
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    break;
+  case 12: // C
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    break;
+  case 13: // d (lowercase cuz 0)
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    break;
+  case 14: // E
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    break;
+  case 15: // F
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    break;
+  case 16: // backwards C, counter clock wise
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegD, ON_OFF);
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    break;
+  case 17: // H for humidity
+    digitalWrite(SevenSegB, ON_OFF);
+    digitalWrite(SevenSegC, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+    digitalWrite(SevenSegG, ON_OFF);
+    break;
+  case 18: // weird looking t for temperature
+    digitalWrite(SevenSegA, ON_OFF);
+    digitalWrite(SevenSegE, ON_OFF);
+    digitalWrite(SevenSegF, ON_OFF);
+  default:
+    break;
+  }
+}
+
+void printLR(int side, int off_side, int num)
+{
+    digitalWrite(off_side, LOW);
+    digitalWrite(side, HIGH);
+    numbers(num, HIGH);
+    vTaskDelay(FRAME_RATE);
+    numbers(num, LOW);
+}
+
+void segManager(int lNum, int rNum)
+{
+  xQueueSend(LeftQueue, &lNum, portMAX_DELAY);
+  xQueueSend(RightQueue, &rNum, portMAX_DELAY);
+}
+
+void checkQueueIsFull(int test)
+{
+  if(test == 0)
+  {
+    for(int i = 0; i <= 15; i++)
+    {
+      //xQueueSend(RightQueue, &i, portMAX_DELAY); // (to go back to 2 queues)
+      for(int j = 0; j <= 15; j++)
+      {
+        // round robin effect here, one task gets to the queue first
+        // because they are the same priority
+        // this is in each instance of adding to the queue
+        segManager(i, j);
+        vTaskDelay(HALF_SEC/4);
+      }
+    }
+    for(int i = 0; i < 5; i++) segManager(11, 11);
+  }
+  if(xQueueIsQueueFullFromISR(LeftQueue) == pdTRUE) // if left is full, so is right
+  {
+    xQueueReset(LeftQueue);
+    xQueueReset(RightQueue);
+    xSemaphoreGive(DisplaySemaphore);
+    segManager(0, 15);
+    vTaskDelay(ONE_SEC * 5);
+    xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+  }
+  else 
+  {
+    xSemaphoreGive(DisplaySemaphore);
+    vTaskDelay(ONE_SEC * 3);
+    xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+    //vTaskDelay(ONE_SEC * 3);
+  }
+}
+
+/*--------------------------------------------------*/
+/*---------------------- Tasks ---------------------*/
+/*--------------------------------------------------*/
+
+// This is the driver of the system
+// It uses two queues to transfer data back and forth from the two left and right
+// seven segment displays.
+// 
+// This function I feel will be useful for later in the semester, feels 
+// moduler enough
+void TaskMain(void *pvParameters)
+{
+  (void)pvParameters;
+  int test = 1;
+  int stepCount = 0;
+  int temp, humid;
+  int i = 0;
+  for(;;)
+  {
+    // state 5
+    if(digitalRead(DIP3) == OFF)
+    {
+      // do stuff here based on dip switches
+      //segManager(5, 8);
+      // dont do anything with DIP3 on
+    }
+    // state 4
+    else if(digitalRead(DIP2) == OFF && digitalRead(DIP1) == OFF)
+    {
+      // this one varies
+      segManager(4, 5);
+      checkQueueIsFull(test);
+      while(digitalRead(DIP2) == OFF && digitalRead(DIP1) == OFF && digitalRead(DIP3) == ON)
+      {
+        i = 1;
+        segManager(4, 12);
+        stepCount = 1;
+        Serial.print("Stepper motor moving clockwise ");
+        Serial.print(NUM_STEPS_PER_REV);
+        Serial.println(" steps");
+        while(i <= NUM_STEPS_PER_REV && digitalRead(DIP2) == OFF && digitalRead(DIP1) == OFF && digitalRead(DIP3) == ON)
+        {
+          xQueueSend(StepperQueue, &stepCount, portMAX_DELAY);
+          taskYIELD();
+          xSemaphoreGive(DisplaySemaphore);
+          vTaskDelay(ONE_TICK);
+          xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+          i++;
+        }
+        i = 1;
+        segManager(4, 16);
+        stepCount = -1;
+        Serial.print("Stepper motor moving counterclockwise ");
+        Serial.print(NUM_STEPS_PER_REV);
+        Serial.println(" steps");
+        while(i <= NUM_STEPS_PER_REV && digitalRead(DIP2) == OFF && digitalRead(DIP1) == OFF && digitalRead(DIP3) == ON)
+        {
+          xQueueSend(StepperQueue, &stepCount, portMAX_DELAY);
+          taskYIELD();
+          xSemaphoreGive(DisplaySemaphore);
+          vTaskDelay(ONE_TICK);
+          xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+          i++;
+        }
+      }
+    }
+    // state 3
+    else if(digitalRead(DIP2) == OFF)
+    {
+      segManager(3, 16);
+      checkQueueIsFull(test);
+      Serial.println("Stepper motor moving counterclockwise until DIP switch changes");
+      while(digitalRead(DIP2) == OFF && digitalRead(DIP3) == ON && digitalRead(DIP1) == ON)
+      {
+        stepCount = -1;
+        xQueueSend(StepperQueue, &stepCount, portMAX_DELAY);
+        taskYIELD();
+        xSemaphoreGive(DisplaySemaphore);
+        vTaskDelay(ONE_TICK);
+        xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+      }
+    }
+    // state 2
+    else if(digitalRead(DIP1) == OFF)
+    {
+      segManager(2, 12);
+      checkQueueIsFull(test);
+      Serial.println("Stepper motor moving clockwise until DIP switch changes");
+      while(digitalRead(DIP1) == OFF && digitalRead(DIP2) == ON)
+      {
+        stepCount = 1;
+        xQueueSend(StepperQueue, &stepCount, portMAX_DELAY);
+        taskYIELD();
+        xSemaphoreGive(DisplaySemaphore);
+        vTaskDelay(ONE_TICK);
+        xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+      }
+    }
+    // state 1 humidity
+    else if(digitalRead(DIP0) == OFF)
+    {
+      segManager(1, 17);
+      checkQueueIsFull(test);
+      Serial.println("Stepper motor moving based on humidity");
+      while(digitalRead(DIP0) == OFF && digitalRead(DIP1) == ON && digitalRead(DIP2) == ON && digitalRead(DIP3) == ON)
+      {
+        humid = temp_hum_sensor.readHumidity();
+        Serial.print("Humidity: ");
+        Serial.println(humid);
+        i = 1;
+        while(i <= humid)
+        {
+          stepCount = 1;
+          xQueueSend(StepperQueue, &stepCount, portMAX_DELAY);
+          taskYIELD();
+          xSemaphoreGive(DisplaySemaphore);
+          vTaskDelay(ONE_TICK);
+          xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+          i++;
+        }
+        xSemaphoreGive(DisplaySemaphore);
+        vTaskDelay(HALF_SEC/2);
+        xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+      }
+    }
+    // state 0 temp
+    else if(digitalRead(DIP0) == ON)
+    {
+      segManager(1, 18);
+      checkQueueIsFull(test);
+      Serial.println("Stepper motor moving based on temperature");
+      while(digitalRead(DIP0) == ON && digitalRead(DIP1) == ON && digitalRead(DIP2) == ON && digitalRead(DIP3) == ON)
+      {
+        temp = temp_hum_sensor.readTemperature();
+        Serial.print("Temperature: ");
+        Serial.println(temp);
+        i = 1;
+        while(i <= temp)
+        {
+          stepCount = 1;
+          xQueueSend(StepperQueue, &stepCount, portMAX_DELAY);
+          taskYIELD();
+          xSemaphoreGive(DisplaySemaphore);
+          vTaskDelay(ONE_TICK);
+          xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+          i++;
+        }
+        xSemaphoreGive(DisplaySemaphore);
+        vTaskDelay(HALF_SEC/2);
+        xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+      }
+    }
+    //display OF
+    test = 1;
+  }
+}
+
+// blink task, originally implemented in main, but needs to be separate task
+void TaskBlink(void *pvParameters)
+{
+  int blink = 0;
+  for(;;)
+  {
+    xQueueReceive(BlinkQueue, &blink, portMAX_DELAY);
+    digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)
+    vTaskDelay(HALF_SEC/2);
+    digitalWrite(LED_BUILTIN, LOW);    // turn the LED off by making the voltage LOW
+  }
+}
+
+// this works with the left part of the seven segment display
+void TaskSevenSeg(void *pvParameters)
+{
+  (void)pvParameters;
+  int num = 0, num2 = 0;
+  for (;;)
+  {
+    xSemaphoreTake(DisplaySemaphore, portMAX_DELAY);
+    xQueueReceive(LeftQueue, &num, 0); // receieve from left queue value from main
+    printLR(SevenSegCC2, SevenSegCC1, num); // function that task delays and prints to screen
+    xQueueReceive(RightQueue, &num2, 0); // receieve from right queue value from main
+    printLR(SevenSegCC1, SevenSegCC2, num2); // function that task delays and prints to screen
+    xSemaphoreGive(DisplaySemaphore);
+  }
+}
+
+void TaskStepperMotor(void *pvParameters)
+{
+  (void)pvParameters;
+  int num_steps = 0;
+  for(;;)
+  {
+    xQueueReceive(StepperQueue, &num_steps, portMAX_DELAY);
+    step_motor.step(num_steps);
+    taskYIELD();
+  }
+}
