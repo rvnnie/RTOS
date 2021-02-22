@@ -351,6 +351,8 @@ void checkQueueIsFull(int test)
 // 
 // This function I feel will be useful for later in the semester, feels 
 // moduler enough
+//
+// Added stepper queue, so data travels to stepper task as well
 void TaskMain(void *pvParameters)
 {
   (void)pvParameters;
